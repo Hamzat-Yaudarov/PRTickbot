@@ -106,23 +106,37 @@ class Database {
     const { user_id, username, first_name, last_name, referral_code } = userData;
     try {
       const result = await this.pool.query(
-        `INSERT INTO users (user_id, username, first_name, last_name, referral_code) 
-         VALUES ($1, $2, $3, $4, $5) 
-         ON CONFLICT (user_id) DO NOTHING 
+        `INSERT INTO users (user_id, username, first_name, last_name, referral_code)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (user_id) DO UPDATE SET
+           username = EXCLUDED.username,
+           first_name = EXCLUDED.first_name,
+           last_name = EXCLUDED.last_name
          RETURNING *`,
         [user_id, username, first_name, last_name, referral_code]
       );
-      return result.rows[0];
+      return result.rows[0] || await this.getUser(user_id);
     } catch (error) {
-      console.error('Ошибка создания пользователя:', error);
-      return null;
+      console.error('Ошибка ��оздания пользователя:', error);
+      // Попытка получить существующего пользователя
+      try {
+        return await this.getUser(user_id);
+      } catch (getError) {
+        console.error('Ошибка получения пользователя после неудачного создания:', getError);
+        return null;
+      }
     }
   }
 
   async getUser(user_id) {
     try {
-      const result = await this.pool.query('SELECT * FROM users WHERE user_id = $1', [user_id]);
-      return result.rows[0];
+      const result = await Promise.race([
+        this.pool.query('SELECT * FROM users WHERE user_id = $1', [user_id]),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Query timeout')), 5000)
+        )
+      ]);
+      return result.rows[0] || null;
     } catch (error) {
       console.error('Ошибка получения пользователя:', error);
       return null;

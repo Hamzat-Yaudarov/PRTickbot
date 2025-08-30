@@ -123,7 +123,7 @@ class TickPiarBot {
       }
     });
 
-    // Обработка текстовых сообщений для создания заданий
+    // Обраб��тка текстовых сообщений для создания заданий
     this.bot.on('text', async (ctx) => {
       const userId = ctx.from.id;
       const userState = this.userStates.get(userId);
@@ -151,7 +151,7 @@ class TickPiarBot {
       await this.checkSponsorSubscriptions(ctx);
     });
 
-    // Обработка сообщений в группах (проверка спонсорских подписок)
+    // Обработка сообщений в группах (проверка спонсорс��их подписок)
     this.bot.on('message', async (ctx) => {
       if (ctx.chat.type === 'group' || ctx.chat.type === 'supergroup') {
         await this.checkUserCanSendMessage(ctx);
@@ -407,29 +407,61 @@ class TickPiarBot {
 
   // Начало создания задания
   async startTaskCreation(ctx) {
-    const userId = ctx.from.id;
-    const user = await db.getUser(userId);
+    try {
+      const userId = ctx.from.id;
+      const user = await Promise.race([
+        db.getUser(userId),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Timeout')), 3000)
+        )
+      ]);
 
-    if (!user || user.tick_balance < config.MIN_TASK_REWARD) {
-      await ctx.answerCbQuery('❌ Недостаточно средств для создания задания');
-      return;
+      if (!user || user.tick_balance < config.MIN_TASK_REWARD) {
+        const errorMsg = user ?
+          '❌ Недостаточно средств для создания задания' :
+          '❌ О��ибка получения данных пользователя';
+
+        if (ctx.callbackQuery) {
+          await ctx.answerCbQuery(errorMsg);
+        } else {
+          await ctx.reply(errorMsg);
+        }
+        return;
+      }
+
+      this.userStates.set(userId, {
+        step: 'channel_username',
+        taskData: {}
+      });
+
+      const message = '📝 Создание задания\n\n' +
+        'Шаг 1/4: Отправьте username канала или чата\n\n' +
+        '💡 Пример: @mychannel или @mychat\n' +
+        '⚠️ Убедитесь, что бот добавлен в ваш канал/чат как администратор!';
+
+      const keyboard = Markup.inlineKeyboard([
+        [Markup.button.callback('❌ Отмена', 'promote')]
+      ]);
+
+      if (ctx.callbackQuery) {
+        await ctx.editMessageText(message, keyboard);
+      } else {
+        await ctx.reply(message, keyboard);
+      }
+    } catch (error) {
+      console.error('Ошибка начала создания задания:', error);
+      const errorMsg = '❌ Ошибка создания задания. Попробуйте позже.';
+
+      try {
+        if (ctx.callbackQuery) {
+          await ctx.answerCbQuery(errorMsg);
+        } else {
+          await ctx.reply(errorMsg);
+        }
+      } catch (sendError) {
+        console.error('Ошибка отправки сообщения об ошибке:', sendError);
+      }
     }
-
-    this.userStates.set(userId, {
-      step: 'channel_username',
-      taskData: {}
-    });
-
-    const message = '📝 Создание з��дания\n\n' +
-      'Шаг 1/4: Отправьте username канала или чата\n\n' +
-      '💡 Пример: @mychannel или @mychat\n' +
-      '⚠️ Убедитесь, что бот добавлен в ваш канал/чат как администратор!';
-
-    const keyboard = Markup.inlineKeyboard([
-      [Markup.button.callback('❌ Отмена', 'promote')]
-    ]);
-
-    await ctx.editMessageText(message, keyboard);
   }
 
   // Обработка шагов создания задания
@@ -505,7 +537,7 @@ class TickPiarBot {
 
     const user = await db.getUser(userId);
     if (user.tick_balance < reward) {
-      await ctx.reply('❌ Недостаточно средств на балансе!');
+      await ctx.reply('❌ Недостаточ��о средств на балансе!');
       return;
     }
 
@@ -545,7 +577,7 @@ class TickPiarBot {
         `📢 Канал: ${task.channel_title}\n` +
         `💰 Награда: ${task.reward} Tick коинов\n` +
         `📝 Описание: ${task.description || 'Стандартное'}\n\n` +
-        'Ваше задание появилось в разделе "Заработать" для других пользователей!';
+        'Ваше задание появилось в разделе "Заработать" ��ля других пользователей!';
 
       await ctx.reply(message);
     } else {
@@ -559,15 +591,40 @@ class TickPiarBot {
   async showCabinet(ctx) {
     try {
       const userId = ctx.from.id;
-      const stats = await Promise.race([
-        db.getUserStats(userId),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('Timeout')), 5000)
-        )
-      ]);
 
+      // Получаем статистику с повторными попытками при ошибке
+      let stats = null;
+      let attempts = 0;
+      const maxAttempts = 3;
+
+      while (!stats && attempts < maxAttempts) {
+        try {
+          attempts++;
+          stats = await Promise.race([
+            db.getUserStats(userId),
+            new Promise((_, reject) =>
+              setTimeout(() => reject(new Error('Timeout')), 3000)
+            )
+          ]);
+
+          if (stats) break;
+
+        } catch (error) {
+          console.error(`Попытка ${attempts} получения статистики:`, error);
+          if (attempts < maxAttempts) {
+            await new Promise(resolve => setTimeout(resolve, 500)); // Пауза 500мс
+          }
+        }
+      }
+
+      // Используем значения по умолчанию если не удалось получить данные
       if (!stats) {
-        throw new Error('No stats returned');
+        stats = {
+          balance: 0,
+          completed_tasks: 0,
+          created_tasks: 0,
+          referrals: 0
+        };
       }
 
       const message = '👤 Мой кабинет\n\n' +
@@ -588,7 +645,7 @@ class TickPiarBot {
         await ctx.reply(message, keyboard);
       }
     } catch (error) {
-      console.error('Ошибка показа кабинета:', error);
+      console.error('Критическая ошибка показа кабинета:', error);
       const errorKeyboard = Markup.inlineKeyboard([
         [Markup.button.callback('🔄 Попробовать снова', 'cabinet')],
         [Markup.button.callback('⬅️ Назад', 'main_menu')]
@@ -596,10 +653,14 @@ class TickPiarBot {
 
       const errorMessage = '❌ Ошибка загрузки кабинета. Попробуйте снова.';
 
-      if (ctx.callbackQuery) {
-        await ctx.editMessageText(errorMessage, errorKeyboard);
-      } else {
-        await ctx.reply(errorMessage, errorKeyboard);
+      try {
+        if (ctx.callbackQuery) {
+          await ctx.editMessageText(errorMessage, errorKeyboard);
+        } else {
+          await ctx.reply(errorMessage, errorKeyboard);
+        }
+      } catch (sendError) {
+        console.error('Ошибка отправки сообщения об ошибке:', sendError);
       }
     }
   }
@@ -608,22 +669,61 @@ class TickPiarBot {
   async showReferralMenu(ctx) {
     try {
       const userId = ctx.from.id;
-      const user = await Promise.race([
-        db.getUser(userId),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('Timeout')), 5000)
-        )
-      ]);
 
+      // Получаем данные пользователя и статистику одновременно с повторными попытками
+      let user = null;
+      let stats = null;
+      let attempts = 0;
+      const maxAttempts = 3;
+
+      while ((!user || !stats) && attempts < maxAttempts) {
+        try {
+          attempts++;
+
+          // Получаем данные параллельно
+          const [userData, userStats] = await Promise.all([
+            Promise.race([
+              db.getUser(userId),
+              new Promise((_, reject) =>
+                setTimeout(() => reject(new Error('User timeout')), 3000)
+              )
+            ]),
+            Promise.race([
+              db.getUserStats(userId),
+              new Promise((_, reject) =>
+                setTimeout(() => reject(new Error('Stats timeout')), 3000)
+              )
+            ])
+          ]);
+
+          user = userData;
+          stats = userStats;
+
+          if (user && stats) break;
+
+        } catch (error) {
+          console.error(`Попытка ${attempts} получения данных реферальной системы:`, error);
+          if (attempts < maxAttempts) {
+            await new Promise(resolve => setTimeout(resolve, 500)); // Пауза 500мс
+          }
+        }
+      }
+
+      // Используем значения по умолчанию
       if (!user) {
-        throw new Error('User not found');
+        user = {
+          referral_code: `temp_${userId}_${Date.now()}`
+        };
+      }
+
+      if (!stats) {
+        stats = {
+          referrals: 0
+        };
       }
 
       const referralLink = `https://t.me/${config.BOT_USERNAME}?start=${user.referral_code}`;
-
-      // Получаем статистику рефералов
-      const stats = await db.getUserStats(userId);
-      const referralCount = stats ? stats.referrals : 0;
+      const referralCount = stats.referrals || 0;
       const totalEarned = referralCount * config.REFERRAL_BONUS;
 
       const message = '🔗 Реферальная система\n\n' +
@@ -646,7 +746,7 @@ class TickPiarBot {
         await ctx.reply(message, keyboard);
       }
     } catch (error) {
-      console.error('Ошибка показа реферальной системы:', error);
+      console.error('Критическая ошибка показа реферальной системы:', error);
       const errorKeyboard = Markup.inlineKeyboard([
         [Markup.button.callback('🔄 Попробовать снова', 'referral')],
         [Markup.button.callback('⬅️ Назад', 'main_menu')]
@@ -654,10 +754,14 @@ class TickPiarBot {
 
       const errorMessage = '❌ Ошибка загрузки реферальной системы. Попробуйте снова.';
 
-      if (ctx.callbackQuery) {
-        await ctx.editMessageText(errorMessage, errorKeyboard);
-      } else {
-        await ctx.reply(errorMessage, errorKeyboard);
+      try {
+        if (ctx.callbackQuery) {
+          await ctx.editMessageText(errorMessage, errorKeyboard);
+        } else {
+          await ctx.reply(errorMessage, errorKeyboard);
+        }
+      } catch (sendError) {
+        console.error('Ошибка отправки сообщения об ошибке:', sendError);
       }
     }
   }
@@ -717,7 +821,7 @@ class TickPiarBot {
             can_pin_messages: false
           });
 
-          const message = `👋 @${member.username || member.first_name}, добро пожаловать!\n\n` +
+          const message = `👋 @${member.username || member.first_name}, до��ро пожаловать!\n\n` +
             '🔒 Для участия в чате подпишитесь на спонсорские каналы:\n' +
             missingChannels.map(ch => `📢 ${ch}`).join('\n') + '\n\n' +
             '✅ После подписки ваши ограничения будут сняты автоматически.';

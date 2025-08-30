@@ -6,14 +6,50 @@ class TickPiarBot {
   constructor() {
     this.bot = new Telegraf(config.BOT_TOKEN);
     this.userStates = new Map(); // Для хранения состояний пользователей
+    this.userCache = new Map(); // Кэш для пользователей
+    this.taskCache = new Map(); // Кэш для заданий
+
+    // Очистка кэша каждые 5 минут
+    setInterval(() => {
+      this.userCache.clear();
+      this.taskCache.clear();
+    }, 5 * 60 * 1000);
+
     this.init();
   }
 
+  setupErrorHandlers() {
+    // Обработка ошибок Telegraf
+    this.bot.catch((err, ctx) => {
+      console.error('❌ Ошибка Telegraf:', err);
+
+      if (ctx && ctx.reply) {
+        ctx.reply('❌ Произошла ошибка. Попроб��йте позже.')
+          .catch(e => console.error('Ошибка отправки сообщения об ошибке:', e));
+      }
+    });
+
+    // Обработка ошибок Node.js
+    process.on('uncaughtException', (error) => {
+      console.error('❌ Необработанная ошибка:', error);
+    });
+
+    process.on('unhandledRejection', (reason, promise) => {
+      console.error('❌ Необработанное отклонение промиса:', reason);
+    });
+  }
+
   async init() {
-    await db.init();
-    this.setupHandlers();
-    this.bot.launch();
-    console.log('🚀 TickPiar Bot запущен!');
+    try {
+      await db.init();
+      this.setupHandlers();
+      this.setupErrorHandlers();
+      await this.bot.launch();
+      console.log('🚀 TickPiar Bot запущен!');
+    } catch (error) {
+      console.error('❌ Ошибка запуска бота:', error);
+      process.exit(1);
+    }
   }
 
   setupHandlers() {
@@ -32,8 +68,15 @@ class TickPiarBot {
       const userId = ctx.from.id;
 
       try {
+        // Отвечаем на callback быстро
         await ctx.answerCbQuery();
-        
+
+        // Добавляем индикатор загрузки только для медленных операций
+        let processingMsg = null;
+        if (['cabinet', 'referral', 'earn'].includes(data)) {
+          processingMsg = await ctx.reply('⏳ Загрузка...');
+        }
+
         switch (data) {
           case 'main_menu':
             await this.showMainMenu(ctx);
@@ -60,8 +103,23 @@ class TickPiarBot {
             }
             break;
         }
+
+        // Удаляем индикатор загрузки если он был создан
+        if (processingMsg) {
+          try {
+            await ctx.telegram.deleteMessage(ctx.chat.id, processingMsg.message_id);
+          } catch (e) {
+            // Игнорируем ошибки удаления
+          }
+        }
+
       } catch (error) {
         console.error('Ошибка обработки callback:', error);
+        try {
+          await ctx.reply('❌ Произошла ошибка. Попробуйте позже.');
+        } catch (e) {
+          console.error('Ошибка отправки сообщения об ошибке:', e);
+        }
       }
     });
 
@@ -164,39 +222,79 @@ class TickPiarBot {
 
   // Меню "Заработать"
   async showEarnMenu(ctx) {
-    const userId = ctx.from.id;
-    const availableTasks = await db.getAvailableTasks(userId);
+    try {
+      const userId = ctx.from.id;
+      const availableTasks = await Promise.race([
+        db.getAvailableTasks(userId, 5), // Ограничиваем до 5 заданий для быстроты
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Timeout')), 5000)
+        )
+      ]);
 
-    if (availableTasks.length === 0) {
-      const keyboard = Markup.inlineKeyboard([
+      if (availableTasks.length === 0) {
+        const keyboard = Markup.inlineKeyboard([
+          [Markup.button.callback('🔄 Обновить', 'earn')],
+          [Markup.button.callback('⬅️ Назад', 'main_menu')]
+        ]);
+
+        const message = '💰 Заработать\n\n❌ Нет доступных заданий.\nСоздайте свое задание в разделе "Рекламировать"!';
+
+        if (ctx.callbackQuery) {
+          await ctx.editMessageText(message, keyboard);
+        } else {
+          await ctx.reply(message, keyboard);
+        }
+        return;
+      }
+
+      let message = '💰 Доступные задания:\n\n';
+      const buttons = [];
+
+      availableTasks.forEach((task, index) => {
+        const title = task.channel_title || task.channel_username;
+        const shortTitle = title.length > 25 ? title.substring(0, 25) + '...' : title;
+
+        message += `${index + 1}. ${shortTitle}\n`;
+        message += `💰 ${task.reward} коинов | 👥 ${task.completed_count}/${task.max_completions}\n`;
+        if (task.description && task.description.length > 0) {
+          const desc = task.description.length > 30 ? task.description.substring(0, 30) + '...' : task.description;
+          message += `📝 ${desc}\n`;
+        }
+        message += '\n';
+
+        buttons.push([Markup.button.callback(
+          `✅ ${index + 1} → ${task.reward} 🪙`,
+          `complete_task_${task.task_id}`
+        )]);
+      });
+
+      buttons.push(
+        [Markup.button.callback('🔄 Обновить', 'earn')],
+        [Markup.button.callback('⬅️ Назад', 'main_menu')]
+      );
+
+      const keyboard = Markup.inlineKeyboard(buttons);
+
+      if (ctx.callbackQuery) {
+        await ctx.editMessageText(message, keyboard);
+      } else {
+        await ctx.reply(message, keyboard);
+      }
+    } catch (error) {
+      console.error('Ошибка показа меню заработка:', error);
+      const errorKeyboard = Markup.inlineKeyboard([
+        [Markup.button.callback('🔄 Попробовать снова', 'earn')],
         [Markup.button.callback('⬅️ Назад', 'main_menu')]
       ]);
-      
-      await ctx.editMessageText(
-        '💰 Заработать\n\n❌ Нет доступных заданий.\nСоздайте свое задание в разделе "Рекламировать"!',
-        keyboard
-      );
-      return;
+
+      const errorMessage = '❌ Ошибка загрузки заданий. Попробуйте снова.';
+
+      if (ctx.callbackQuery) {
+        await ctx.editMessageText(errorMessage, errorKeyboard);
+      } else {
+        await ctx.reply(errorMessage, errorKeyboard);
+      }
     }
-
-    let message = '💰 Доступные задания:\n\n';
-    const buttons = [];
-
-    availableTasks.slice(0, 10).forEach((task, index) => {
-      message += `${index + 1}. ${task.channel_title || task.channel_username}\n`;
-      message += `💰 Награда: ${task.reward} Tick коинов\n`;
-      message += `📝 ${task.description || 'Подпишитесь на канал'}\n\n`;
-      
-      buttons.push([Markup.button.callback(
-        `✅ Выполнить ${index + 1} (${task.reward} 🪙)`, 
-        `complete_task_${task.task_id}`
-      )]);
-    });
-
-    buttons.push([Markup.button.callback('⬅️ Назад', 'main_menu')]);
-    
-    const keyboard = Markup.inlineKeyboard(buttons);
-    await ctx.editMessageText(message, keyboard);
   }
 
   // Выполнение задания
@@ -213,8 +311,16 @@ class TickPiarBot {
 
       const task = taskResult.rows[0];
       
-      // Проверяем подписку на канал
-      const isSubscribed = await this.checkChannelSubscription(ctx, task.channel_username);
+      // Проверяем подписку на канал с таймаутом
+      const isSubscribed = await Promise.race([
+        this.checkChannelSubscription(ctx, task.channel_username),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Subscription check timeout')), 5000)
+        )
+      ]).catch(error => {
+        console.error('Ошибка проверки подписки:', error);
+        return false;
+      });
       
       if (isSubscribed) {
         const completedTask = await db.completeTask(userId, taskId);
@@ -249,8 +355,30 @@ class TickPiarBot {
   // Проверка подписки на канал
   async checkChannelSubscription(ctx, channelUsername) {
     try {
-      const chatMember = await ctx.telegram.getChatMember(channelUsername, ctx.from.id);
-      return ['member', 'administrator', 'creator'].includes(chatMember.status);
+      const cacheKey = `${ctx.from.id}_${channelUsername}`;
+      const cached = this.userCache.get(cacheKey);
+
+      // Кэш на 30 секунд
+      if (cached && Date.now() - cached.timestamp < 30000) {
+        return cached.subscribed;
+      }
+
+      const chatMember = await Promise.race([
+        ctx.telegram.getChatMember(channelUsername, ctx.from.id),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Timeout')), 3000)
+        )
+      ]);
+
+      const subscribed = ['member', 'administrator', 'creator'].includes(chatMember.status);
+
+      // Сохраняем в кэш
+      this.userCache.set(cacheKey, {
+        subscribed,
+        timestamp: Date.now()
+      });
+
+      return subscribed;
     } catch (error) {
       console.error('Ошибка проверки подписки:', error);
       return false;
@@ -292,7 +420,7 @@ class TickPiarBot {
       taskData: {}
     });
 
-    const message = '📝 Создание задания\n\n' +
+    const message = '📝 Создание з��дания\n\n' +
       'Шаг 1/4: Отправьте username канала или чата\n\n' +
       '💡 Пример: @mychannel или @mychat\n' +
       '⚠️ Убедитесь, что бот добавлен в ваш канал/чат как администратор!';
@@ -429,52 +557,109 @@ class TickPiarBot {
 
   // Кабинет пользователя
   async showCabinet(ctx) {
-    const userId = ctx.from.id;
-    const stats = await db.getUserStats(userId);
-    
-    if (!stats) {
-      await ctx.answerCbQuery('❌ Ошибка получения данных');
-      return;
+    try {
+      const userId = ctx.from.id;
+      const stats = await Promise.race([
+        db.getUserStats(userId),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Timeout')), 5000)
+        )
+      ]);
+
+      if (!stats) {
+        throw new Error('No stats returned');
+      }
+
+      const message = '👤 Мой кабинет\n\n' +
+        `💰 Баланс: ${stats.balance} Tick коинов\n` +
+        `✅ Выполнено заданий: ${stats.completed_tasks}\n` +
+        `📢 Создано заданий: ${stats.created_tasks}\n` +
+        `🔗 Приглашено рефералов: ${stats.referrals}\n\n` +
+        `👤 Ваш ID: ${userId}`;
+
+      const keyboard = Markup.inlineKeyboard([
+        [Markup.button.callback('🔄 Обновить', 'cabinet')],
+        [Markup.button.callback('⬅️ Назад', 'main_menu')]
+      ]);
+
+      if (ctx.callbackQuery) {
+        await ctx.editMessageText(message, keyboard);
+      } else {
+        await ctx.reply(message, keyboard);
+      }
+    } catch (error) {
+      console.error('Ошибка показа кабинета:', error);
+      const errorKeyboard = Markup.inlineKeyboard([
+        [Markup.button.callback('🔄 Попробовать снова', 'cabinet')],
+        [Markup.button.callback('⬅️ Назад', 'main_menu')]
+      ]);
+
+      const errorMessage = '❌ Ошибка загрузки кабинета. Попробуйте снова.';
+
+      if (ctx.callbackQuery) {
+        await ctx.editMessageText(errorMessage, errorKeyboard);
+      } else {
+        await ctx.reply(errorMessage, errorKeyboard);
+      }
     }
-
-    const message = '👤 Мой кабинет\n\n' +
-      `💰 Баланс: ${stats.balance} Tick коинов\n` +
-      `✅ Выполнено заданий: ${stats.completed_tasks}\n` +
-      `📢 Создано заданий: ${stats.created_tasks}\n` +
-      `🔗 Приглашено рефералов: ${stats.referrals}\n\n` +
-      `👤 Ваш ID: ${userId}`;
-
-    const keyboard = Markup.inlineKeyboard([
-      [Markup.button.callback('⬅️ Назад', 'main_menu')]
-    ]);
-
-    await ctx.editMessageText(message, keyboard);
   }
 
   // Реферальная система
   async showReferralMenu(ctx) {
-    const userId = ctx.from.id;
-    const user = await db.getUser(userId);
-    
-    if (!user) {
-      await ctx.answerCbQuery('❌ Ошибка получения данных');
-      return;
+    try {
+      const userId = ctx.from.id;
+      const user = await Promise.race([
+        db.getUser(userId),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Timeout')), 5000)
+        )
+      ]);
+
+      if (!user) {
+        throw new Error('User not found');
+      }
+
+      const referralLink = `https://t.me/${config.BOT_USERNAME}?start=${user.referral_code}`;
+
+      // Получаем статистику рефералов
+      const stats = await db.getUserStats(userId);
+      const referralCount = stats ? stats.referrals : 0;
+      const totalEarned = referralCount * config.REFERRAL_BONUS;
+
+      const message = '🔗 Реферальная система\n\n' +
+        `💰 За каждого друга: ${config.REFERRAL_BONUS} Tick коинов\n` +
+        `👥 Приглашено: ${referralCount} человек\n` +
+        `💎 Заработано: ${totalEarned} коинов\n\n` +
+        '📤 Ваша реферальная ссылка:\n' +
+        `\`${referralLink}\`\n\n` +
+        '📢 Отправьте эту ссылку друзьям!';
+
+      const keyboard = Markup.inlineKeyboard([
+        [Markup.button.url('📤 Поделиться', `https://t.me/share/url?url=${encodeURIComponent(referralLink)}&text=${encodeURIComponent('🤖 Присоединяйся к TickPiar Bot и зарабатывай Tick коины!')}`)],
+        [Markup.button.callback('🔄 Обновить', 'referral')],
+        [Markup.button.callback('⬅️ Назад', 'main_menu')]
+      ]);
+
+      if (ctx.callbackQuery) {
+        await ctx.editMessageText(message, keyboard);
+      } else {
+        await ctx.reply(message, keyboard);
+      }
+    } catch (error) {
+      console.error('Ошибка показа реферальной системы:', error);
+      const errorKeyboard = Markup.inlineKeyboard([
+        [Markup.button.callback('🔄 Попробовать снова', 'referral')],
+        [Markup.button.callback('⬅️ Назад', 'main_menu')]
+      ]);
+
+      const errorMessage = '❌ Ошибка загрузки реферальной системы. Попробуйте снова.';
+
+      if (ctx.callbackQuery) {
+        await ctx.editMessageText(errorMessage, errorKeyboard);
+      } else {
+        await ctx.reply(errorMessage, errorKeyboard);
+      }
     }
-
-    const referralLink = `https://t.me/${config.BOT_USERNAME}?start=${user.referral_code}`;
-    
-    const message = '🔗 Реферальная система\n\n' +
-      `💰 За каждого приглашенного друга вы получите ${config.REFERRAL_BONUS} Tick коинов!\n\n` +
-      '📤 Ваша реферальная ссылка:\n' +
-      `${referralLink}\n\n` +
-      '📢 Отправьте эту ссылку друзьям. Когда они запустят бота по вашей ссылке, вы получите бонус!';
-
-    const keyboard = Markup.inlineKeyboard([
-      [Markup.button.url('📤 Поделиться', `https://t.me/share/url?url=${encodeURIComponent(referralLink)}`)],
-      [Markup.button.callback('⬅️ Назад', 'main_menu')]
-    ]);
-
-    await ctx.editMessageText(message, keyboard);
   }
 
   // Обработка добавления бота в группу

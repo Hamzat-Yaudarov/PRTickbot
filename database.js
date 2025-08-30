@@ -7,7 +7,13 @@ class Database {
       connectionString: config.DATABASE_URL,
       ssl: {
         rejectUnauthorized: false
-      }
+      },
+      // Оптимизация пула соединений
+      max: 20, // максимум соединений
+      min: 2,  // минимум соединений
+      idleTimeoutMillis: 30000, // таймаут простоя
+      connectionTimeoutMillis: 10000, // таймаут подключ��ния
+      acquireTimeoutMillis: 5000 // таймаут получения соединения
     });
   }
 
@@ -44,7 +50,7 @@ class Database {
         )
       `);
 
-      // Создаем таблицу выполнений заданий
+      // Создаем таблицу выполнений з��даний
       await this.pool.query(`
         CREATE TABLE IF NOT EXISTS task_completions (
           completion_id SERIAL PRIMARY KEY,
@@ -79,7 +85,17 @@ class Database {
         )
       `);
 
-      console.log('✅ База данных инициализирована');
+      // Создаем индексы для оптимизации запросов
+      await this.pool.query('CREATE INDEX IF NOT EXISTS idx_users_referral_code ON users(referral_code)');
+      await this.pool.query('CREATE INDEX IF NOT EXISTS idx_tasks_active ON tasks(is_active, reward, created_at)');
+      await this.pool.query('CREATE INDEX IF NOT EXISTS idx_tasks_creator ON tasks(creator_id)');
+      await this.pool.query('CREATE INDEX IF NOT EXISTS idx_task_completions_user ON task_completions(user_id)');
+      await this.pool.query('CREATE INDEX IF NOT EXISTS idx_task_completions_task ON task_completions(task_id)');
+      await this.pool.query('CREATE INDEX IF NOT EXISTS idx_task_completions_unique ON task_completions(task_id, user_id)');
+      await this.pool.query('CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_id)');
+      await this.pool.query('CREATE INDEX IF NOT EXISTS idx_sponsor_channels_chat ON sponsor_channels(chat_id, is_active)');
+
+      console.log('✅ База данных инициализирована с индексами');
     } catch (error) {
       console.error('❌ Ошибка инициализации базы данных:', error);
     }
@@ -142,18 +158,20 @@ class Database {
     }
   }
 
-  async getAvailableTasks(user_id) {
+  async getAvailableTasks(user_id, limit = 10) {
     try {
       const result = await this.pool.query(`
-        SELECT t.* FROM tasks t 
-        WHERE t.is_active = TRUE 
+        SELECT t.* FROM tasks t
+        WHERE t.is_active = TRUE
         AND t.creator_id != $1
         AND NOT EXISTS (
-          SELECT 1 FROM task_completions tc 
+          SELECT 1 FROM task_completions tc
           WHERE tc.task_id = t.task_id AND tc.user_id = $1
         )
+        AND t.completed_count < t.max_completions
         ORDER BY t.reward DESC, t.created_at DESC
-      `, [user_id]);
+        LIMIT $2
+      `, [user_id, limit]);
       return result.rows;
     } catch (error) {
       console.error('Ошибка получения заданий:', error);
@@ -247,32 +265,53 @@ class Database {
 
   async getUserStats(user_id) {
     try {
-      const user = await this.getUser(user_id);
-      
-      const completedTasks = await this.pool.query(
-        'SELECT COUNT(*) as count FROM task_completions WHERE user_id = $1',
-        [user_id]
-      );
+      // Объединяем все запросы в один для ускорения
+      const result = await this.pool.query(`
+        SELECT
+          u.tick_balance,
+          (
+            SELECT COUNT(*)
+            FROM task_completions tc
+            WHERE tc.user_id = u.user_id
+          ) as completed_tasks,
+          (
+            SELECT COUNT(*)
+            FROM tasks t
+            WHERE t.creator_id = u.user_id
+          ) as created_tasks,
+          (
+            SELECT COUNT(*)
+            FROM referrals r
+            WHERE r.referrer_id = u.user_id
+          ) as referrals
+        FROM users u
+        WHERE u.user_id = $1
+      `, [user_id]);
 
-      const createdTasks = await this.pool.query(
-        'SELECT COUNT(*) as count FROM tasks WHERE creator_id = $1',
-        [user_id]
-      );
+      if (result.rows.length === 0) {
+        return {
+          balance: 0,
+          completed_tasks: 0,
+          created_tasks: 0,
+          referrals: 0
+        };
+      }
 
-      const referrals = await this.pool.query(
-        'SELECT COUNT(*) as count FROM referrals WHERE referrer_id = $1',
-        [user_id]
-      );
-
+      const row = result.rows[0];
       return {
-        balance: user?.tick_balance || 0,
-        completed_tasks: parseInt(completedTasks.rows[0].count),
-        created_tasks: parseInt(createdTasks.rows[0].count),
-        referrals: parseInt(referrals.rows[0].count)
+        balance: parseInt(row.tick_balance) || 0,
+        completed_tasks: parseInt(row.completed_tasks) || 0,
+        created_tasks: parseInt(row.created_tasks) || 0,
+        referrals: parseInt(row.referrals) || 0
       };
     } catch (error) {
       console.error('Ошибка получения статистики:', error);
-      return null;
+      return {
+        balance: 0,
+        completed_tasks: 0,
+        created_tasks: 0,
+        referrals: 0
+      };
     }
   }
 }

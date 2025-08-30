@@ -4,8 +4,10 @@
   "description": "Telegram bot for mutual subscriptions and sponsor channel management",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "nodemon index.js"
+    "start": "node start.js",
+    "dev": "nodemon index.js",
+    "quick": "node index.js",
+    "test-syntax": "node -c index.js && node -c database.js && node -c config.js"
   },
   "dependencies": {
     "telegraf": "^4.15.8",

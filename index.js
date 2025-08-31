@@ -41,13 +41,69 @@ class TickPiarBot {
 
   async init() {
     try {
+      console.log('🔄 Инициализация бота...');
+
+      // Сначала инициализируем базу данных
       await db.init();
+      console.log('✅ База данн��х инициализирована');
+
+      // Настраиваем обработчики
       this.setupHandlers();
       this.setupErrorHandlers();
-      await this.bot.launch();
-      console.log('🚀 TickPiar Bot запущен!');
+
+      // Graceful shutdown handling
+      process.once('SIGINT', () => this.stop('SIGINT'));
+      process.once('SIGTERM', () => this.stop('SIGTERM'));
+
+      console.log('🚀 Запускаем бота...');
+
+      // Запускаем бота с retry логикой для обработки 409 ошибки
+      await this.launchWithRetry();
+
+      console.log('✅ TickPiar Bot успешно запущен!');
     } catch (error) {
-      console.error('❌ Ошибка запуска бота:', error);
+      console.error('❌ Критическая ошибка запуска бота:', error);
+      process.exit(1);
+    }
+  }
+
+  async launchWithRetry(maxRetries = 3) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        await this.bot.launch();
+        return; // Успешный запуск
+      } catch (error) {
+        console.error(`❌ Попытка запуска ${attempt}/${maxRetries} неудачна:`, error.message);
+
+        if (error.response && error.response.error_code === 409) {
+          console.log('⏳ Обнаружен конфликт (409). Ждём завершения другого экземпляра...');
+
+          // Ждем перед повторной попы��кой (экспоненциальная задержка)
+          const delay = Math.min(1000 * Math.pow(2, attempt - 1), 10000);
+          await new Promise(resolve => setTimeout(resolve, delay));
+
+          if (attempt === maxRetries) {
+            console.error('❌ Все попытки запуска исчерпаны. Возможно, другой экземпляр бота еще активен.');
+            throw error;
+          }
+        } else {
+          // Для др��гих ошибок не повторяем попытки
+          throw error;
+        }
+      }
+    }
+  }
+
+  async stop(signal) {
+    console.log(`🛑 Получен сигнал ${signal}. Завершаем работу бота...`);
+    try {
+      if (this.bot) {
+        await this.bot.stop(signal);
+      }
+      console.log('✅ Бот корректно завершен');
+      process.exit(0);
+    } catch (error) {
+      console.error('❌ Ошибка при завершении бота:', error);
       process.exit(1);
     }
   }
@@ -71,11 +127,17 @@ class TickPiarBot {
         // Отвечаем на callback быстро
         await ctx.answerCbQuery();
 
-        // Добавляем индикатор загрузки только для медленных операций
+        // Добавляем ��ндикатор загрузки только для медленных операций
         let processingMsg = null;
-        if (['cabinet', 'referral', 'earn'].includes(data)) {
-          processingMsg = await ctx.reply('⏳ Загрузка...');
+        if (['cabinet', 'referral', 'earn', 'create_task'].includes(data)) {
+          try {
+            processingMsg = await ctx.reply('⏳ Загрузка...');
+          } catch (e) {
+            console.error('Ошибка создания индикатора загрузки:', e);
+          }
         }
+
+        console.log(`📞 Обработка callback: ${data} от пользователя ${userId}`);
 
         switch (data) {
           case 'main_menu':
@@ -100,6 +162,8 @@ class TickPiarBot {
             if (data.startsWith('complete_task_')) {
               const taskId = data.split('_')[2];
               await this.handleTaskCompletion(ctx, taskId);
+            } else {
+              console.log(`⚠️ Неизвестный callback: ${data}`);
             }
             break;
         }
@@ -109,16 +173,31 @@ class TickPiarBot {
           try {
             await ctx.telegram.deleteMessage(ctx.chat.id, processingMsg.message_id);
           } catch (e) {
-            // Игнорируем ошибки удаления
+            // Игнорируем ошибки удаления (сообщение могло быть уже удалено)
+            console.log('Индикатор загрузки уже удален или недоступен');
           }
         }
 
+        console.log(`✅ Callback ${data} обработан успешно`);
+
       } catch (error) {
-        console.error('Ошибка обработки callback:', error);
+        console.error(`❌ Ошибка обработки callback '${data}':`, error);
+
+        // Пытаемся сообщить пользователю об ошибке различными способами
+        const errorMsg = '❌ Произошла ошибка. Попробуйте позже или перезапустите бота командой /start';
+
         try {
-          await ctx.reply('❌ Произошла ошибка. Попробуйте позже.');
-        } catch (e) {
-          console.error('Ошибка отправки сообщения об ошибке:', e);
+          if (ctx.callbackQuery) {
+            await ctx.answerCbQuery(errorMsg, { show_alert: true });
+          }
+        } catch (cbError) {
+          console.error('Ошибка answerCbQuery:', cbError);
+        }
+
+        try {
+          await ctx.reply(errorMsg);
+        } catch (replyError) {
+          console.error('Ош��бка отправки сообщения об ошибке:', replyError);
         }
       }
     });
@@ -146,7 +225,7 @@ class TickPiarBot {
       }
     });
 
-    // Обработка новых участников в группах (для проверки подписок)
+    // Обработка новы�� участников в группах (для проверки подписок)
     this.bot.on('new_chat_members', async (ctx) => {
       await this.checkSponsorSubscriptions(ctx);
     });
@@ -162,23 +241,40 @@ class TickPiarBot {
   // Регистрация пользователя
   async registerUser(ctx, referralCode = null) {
     const user = ctx.from;
-    
-    // Генерируем уникальный реферальный код для пользователя
-    const userReferralCode = this.generateReferralCode(user.id);
-    
-    const userData = {
-      user_id: user.id,
-      username: user.username,
-      first_name: user.first_name,
-      last_name: user.last_name,
-      referral_code: userReferralCode
-    };
+    console.log(`👤 Регистрируем пользователя ${user.id}: ${user.first_name} ${user.last_name || ''}`);
 
-    const createdUser = await db.createUser(userData);
-    
-    // Обрабатываем реферала если есть
-    if (referralCode && createdUser) {
-      await this.processReferralCode(referralCode, user.id);
+    try {
+      // Генерируем уникальный реферальный код для пользователя
+      const userReferralCode = this.generateReferralCode(user.id);
+
+      const userData = {
+        user_id: user.id,
+        username: user.username,
+        first_name: user.first_name,
+        last_name: user.last_name,
+        referral_code: userReferralCode
+      };
+
+      console.log('💾 Создаем пользователя в базе данных...');
+      const createdUser = await db.createUser(userData);
+
+      if (!createdUser) {
+        console.error('❌ Не удалось создать пользователя в базе данных');
+        return null;
+      }
+
+      console.log('✅ Пользователь успешно создан');
+
+      // Обрабатываем реферала если есть
+      if (referralCode && createdUser) {
+        console.log(`🔗 Обрабатываем реферальный код: ${referralCode}`);
+        await this.processReferralCode(referralCode, user.id);
+      }
+
+      return createdUser;
+    } catch (error) {
+      console.error('❌ Ошибка регистрации пользователя:', error);
+      return null;
     }
   }
 
@@ -209,7 +305,7 @@ class TickPiarBot {
     const keyboard = Markup.inlineKeyboard([
       [Markup.button.callback('💰 Заработать', 'earn')],
       [Markup.button.callback('📢 Рекламировать', 'promote')],
-      [Markup.button.callback('👤 Мой кабинет', 'cabinet')],
+      [Markup.button.callback('���� Мой кабинет', 'cabinet')],
       [Markup.button.callback('🔗 Реферальная система', 'referral')]
     ]);
 
@@ -224,10 +320,13 @@ class TickPiarBot {
   async showEarnMenu(ctx) {
     try {
       const userId = ctx.from.id;
+      console.log(`💰 Загружаем меню заработка для пользователя ${userId}`);
+
+      console.log('📋 Получаем доступные задания...');
       const availableTasks = await Promise.race([
         db.getAvailableTasks(userId, 5), // Ограничиваем до 5 заданий для быстроты
         new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('Timeout')), 5000)
+          setTimeout(() => reject(new Error('Database timeout')), 5000)
         )
       ]);
 
@@ -237,7 +336,7 @@ class TickPiarBot {
           [Markup.button.callback('⬅️ Назад', 'main_menu')]
         ]);
 
-        const message = '💰 Заработать\n\n❌ Нет доступных заданий.\nСоздайте свое задание в разделе "Рекламировать"!';
+        const message = '💰 Заработать\n\n❌ Нет ��оступных заданий.\nСоздайте свое задание в разд��ле "Рекламировать"!';
 
         if (ctx.callbackQuery) {
           await ctx.editMessageText(message, keyboard);
@@ -269,13 +368,23 @@ class TickPiarBot {
       });
 
       buttons.push(
-        [Markup.button.callback('🔄 Обновить', 'earn')],
+        [Markup.button.callback('�� Обновить', 'earn')],
         [Markup.button.callback('⬅️ Назад', 'main_menu')]
       );
 
       const keyboard = Markup.inlineKeyboard(buttons);
 
+      console.log(`📋 Отправляем список из ${availableTasks.length} заданий`);
+
       if (ctx.callbackQuery) {
+        // Проверяем, изменилось ли содержимое сообщения
+        const currentMessage = ctx.callbackQuery.message?.text;
+        if (currentMessage && currentMessage === message) {
+          console.log('⚠️ Содержимое меню заработка не изменилось');
+          await ctx.answerCbQuery('✅ Список заданий актуален');
+          return;
+        }
+
         await ctx.editMessageText(message, keyboard);
       } else {
         await ctx.reply(message, keyboard);
@@ -305,7 +414,7 @@ class TickPiarBot {
       // Получаем информацию о задании
       const taskResult = await db.pool.query('SELECT * FROM tasks WHERE task_id = $1', [taskId]);
       if (taskResult.rows.length === 0) {
-        await ctx.answerCbQuery('❌ Задание не найдено');
+        await ctx.answerCbQuery('❌ Задание не най��ено');
         return;
       }
 
@@ -393,7 +502,7 @@ class TickPiarBot {
     let message = '📢 Рекламировать\n\n';
     message += 'Создавайте задания для продвижения ваших каналов!\n\n';
     message += `💰 Ваш баланс: ${user?.tick_balance || 0} Tick коинов\n`;
-    message += `💵 Минимальная награда: ${config.MIN_TASK_REWARD} коинов\n`;
+    message += `💵 ��инимальная награда: ${config.MIN_TASK_REWARD} коинов\n`;
     message += `💵 Максимальная награда: ${config.MAX_TASK_REWARD} коинов\n\n`;
     message += '⚠️ Награда списывается с вашего баланса при создании задания.';
 
@@ -409,6 +518,9 @@ class TickPiarBot {
   async startTaskCreation(ctx) {
     try {
       const userId = ctx.from.id;
+      console.log(`🚀 Начинаем создание задания для пользователя ${userId}`);
+
+      console.log('📊 Получаем данные пользователя...');
       const user = await Promise.race([
         db.getUser(userId),
         new Promise((_, reject) =>
@@ -416,18 +528,43 @@ class TickPiarBot {
         )
       ]);
 
-      if (!user || user.tick_balance < config.MIN_TASK_REWARD) {
-        const errorMsg = user ?
-          '❌ Недостаточно средств для создания задания' :
-          '❌ О��ибка получения данных пользователя';
+      console.log(`👤 Данные пользователя:`, user ? 'найдены' : 'не найдены');
+
+      if (!user) {
+        console.log('❌ Пользователь не найден в базе данных');
+        const errorMsg = '❌ Ошибка: пользователь не найден. Попробуйте /start';
 
         if (ctx.callbackQuery) {
           await ctx.answerCbQuery(errorMsg);
+          await ctx.editMessageText(errorMsg, Markup.inlineKeyboard([
+            [Markup.button.callback('🏠 Главное меню', 'main_menu')]
+          ]));
         } else {
           await ctx.reply(errorMsg);
         }
         return;
       }
+
+      const minBalance = config.MIN_TASK_REWARD || 15;
+      console.log(`💰 Проверяем баланс: ${user.tick_balance} >= ${minBalance}`);
+
+      if (user.tick_balance < minBalance) {
+        const errorMsg = `❌ Недостаточно ��редств для создания задания\n💰 Баланс: ${user.tick_balance} Тик коинов\n📊 Нужно: ${minBalance} Тик коинов`;
+
+        console.log(`❌ Недостаточно средств: ${user.tick_balance} < ${minBalance}`);
+
+        if (ctx.callbackQuery) {
+          await ctx.answerCbQuery('Недостаточно средств');
+          await ctx.editMessageText(errorMsg, Markup.inlineKeyboard([
+            [Markup.button.callback('🏠 Главное меню', 'main_menu')]
+          ]));
+        } else {
+          await ctx.reply(errorMsg);
+        }
+        return;
+      }
+
+      console.log('✅ Баланс достаточный, создаем состояние для пользователя');
 
       this.userStates.set(userId, {
         step: 'channel_username',
@@ -443,23 +580,36 @@ class TickPiarBot {
         [Markup.button.callback('❌ Отмена', 'promote')]
       ]);
 
+      console.log('📝 Отправляем интерфейс создания задания');
+
       if (ctx.callbackQuery) {
         await ctx.editMessageText(message, keyboard);
       } else {
         await ctx.reply(message, keyboard);
       }
+
+      console.log('✅ Создание задания инициировано успешно');
     } catch (error) {
-      console.error('Ошибка начала создания задания:', error);
-      const errorMsg = '❌ Ошибка создания задания. Попробуйте позже.';
+      console.error(`❌ Критическая ошибка в startTaskCreation для пользователя ${userId}:`, error);
+
+      const errorMsg = '❌ Ош��бка создания задания. Возможно, проблемы с базой данных.\n\n' +
+        'Попробуйте:\n' +
+        '1. Перезапустить бота командой /start\n' +
+        '2. Попробовать позже\n' +
+        '3. Обратиться в поддержку';
 
       try {
         if (ctx.callbackQuery) {
-          await ctx.answerCbQuery(errorMsg);
+          await ctx.answerCbQuery('Ошибка создания задания');
+          await ctx.editMessageText(errorMsg, Markup.inlineKeyboard([
+            [Markup.button.callback('🏠 Главное меню', 'main_menu')],
+            [Markup.button.callback('🔄 Попробовать снова', 'create_task')]
+          ]));
         } else {
           await ctx.reply(errorMsg);
         }
       } catch (sendError) {
-        console.error('Ошибка отправки сообщения об ошибке:', sendError);
+        console.error('❌ Критическая ошибка отправки сообщения об ошибке:', sendError);
       }
     }
   }
@@ -515,7 +665,7 @@ class TickPiarBot {
       const message = '📝 Создание задания\n\n' +
         'Шаг 2/4: Укажите награду за выполнение\n\n' +
         `💰 От ${config.MIN_TASK_REWARD} до ${config.MAX_TASK_REWARD} Tick коинов\n` +
-        `📢 Канал: ${chat.title} (${text})`;
+        `��� Канал: ${chat.title} (${text})`;
 
       await ctx.reply(message);
       this.userStates.set(userId, userState);
@@ -547,7 +697,7 @@ class TickPiarBot {
     const message = '📝 Создание задания\n\n' +
       'Шаг 3/4: Опишите задание (необязательно)\n\n' +
       '💡 Например: "Подпишитесь на наш канал с новостями"\n' +
-      'Или отправьте "пропустить" чтобы оставить стандартное описание';
+      'Или отправьте "пропустить" чт��бы оставить стандартное описание';
 
     await ctx.reply(message);
     this.userStates.set(userId, userState);
@@ -577,7 +727,7 @@ class TickPiarBot {
         `📢 Канал: ${task.channel_title}\n` +
         `💰 Награда: ${task.reward} Tick коинов\n` +
         `📝 Описание: ${task.description || 'Стандартное'}\n\n` +
-        'Ваше задание появилось в разделе "Заработать" ��ля других пользователей!';
+        'Ваше задание появилось в разделе "Заработать" ���ля других пользователей!';
 
       await ctx.reply(message);
     } else {
@@ -617,7 +767,7 @@ class TickPiarBot {
         }
       }
 
-      // Используем значения по умолчанию если не удалось получить данные
+      // Используем значения по ум��лчанию если не удалось получить данные
       if (!stats) {
         stats = {
           balance: 0,
@@ -639,7 +789,17 @@ class TickPiarBot {
         [Markup.button.callback('⬅️ Назад', 'main_menu')]
       ]);
 
+      console.log('📊 Отправляем данные кабинета пользователю');
+
       if (ctx.callbackQuery) {
+        // Проверяем, изменилось ли содержимое сообщения
+        const currentMessage = ctx.callbackQuery.message?.text;
+        if (currentMessage && currentMessage === message) {
+          console.log('⚠️ Содержимое сообщения не изменилось, пропускаем обновление');
+          await ctx.answerCbQuery('✅ Данные актуальны');
+          return;
+        }
+
         await ctx.editMessageText(message, keyboard);
       } else {
         await ctx.reply(message, keyboard);
@@ -660,7 +820,7 @@ class TickPiarBot {
           await ctx.reply(errorMessage, errorKeyboard);
         }
       } catch (sendError) {
-        console.error('Ошибка отправки сообщения об ошибке:', sendError);
+        console.error('Ошибка отп��авки сообщения об ошибке:', sendError);
       }
     }
   }
@@ -709,7 +869,7 @@ class TickPiarBot {
         }
       }
 
-      // Используем значения по умолчанию
+      // Используем значени�� по умолчанию
       if (!user) {
         user = {
           referral_code: `temp_${userId}_${Date.now()}`
@@ -730,7 +890,7 @@ class TickPiarBot {
         `💰 За каждого друга: ${config.REFERRAL_BONUS} Tick коинов\n` +
         `👥 Приглашено: ${referralCount} человек\n` +
         `💎 Заработано: ${totalEarned} коинов\n\n` +
-        '📤 Ваша реферальная ссылка:\n' +
+        '📤 Ваша реферальна�� ссылка:\n' +
         `\`${referralLink}\`\n\n` +
         '📢 Отправьте эту ссылку друзьям!';
 
@@ -772,8 +932,8 @@ class TickPiarBot {
     const addedBy = ctx.from;
 
     const welcomeMessage = '🤖 Привет! Я TickPiar Bot!\n\n' +
-      '🛡️ Теперь я могу контролировать доступ к сообщениям в этом чате.\n' +
-      '📢 Администраторы могут настроить обязательные подписки на спонсорские каналы.\n\n' +
+      '🛡️ Теперь я могу контролировать доступ к сообщ��ниям в этом чате.\n' +
+      '📢 Администраторы могут настроить обязательные подпис��и на спонсорские каналы.\n\n' +
       '⚙️ Для настройки обратитесь к создателю: @your_username';
 
     await ctx.reply(welcomeMessage);
@@ -823,7 +983,7 @@ class TickPiarBot {
 
           const message = `👋 @${member.username || member.first_name}, до��ро пожаловать!\n\n` +
             '🔒 Для участия в чате подпишитесь на спонсорские каналы:\n' +
-            missingChannels.map(ch => `📢 ${ch}`).join('\n') + '\n\n' +
+            missingChannels.map(ch => `���� ${ch}`).join('\n') + '\n\n' +
             '✅ После подписки ваши ограничения будут сняты автоматически.';
 
           await ctx.reply(message);

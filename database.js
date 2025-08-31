@@ -12,14 +12,17 @@ class Database {
       max: 20, // максимум соединений
       min: 2,  // минимум соединений
       idleTimeoutMillis: 30000, // таймаут простоя
-      connectionTimeoutMillis: 10000, // таймаут подключ��ния
+      connectionTimeoutMillis: 10000, // таймаут подключения
       acquireTimeoutMillis: 5000 // таймаут получения соединения
     });
   }
 
   async init() {
     try {
-      // Создаем таблицу пользователей
+      console.log('🔄 Начинаем инициализацию базы данных...');
+      
+      // Создаем таблицы последовательно для избежания проблем с FK
+      console.log('📝 Создаем таблицу пользователей...');
       await this.pool.query(`
         CREATE TABLE IF NOT EXISTS users (
           user_id BIGINT PRIMARY KEY,
@@ -33,12 +36,16 @@ class Database {
           is_banned BOOLEAN DEFAULT FALSE
         )
       `);
+      console.log('✅ Таблица users создана');
 
-      // Создаем таблицу заданий
+      // Ждем немного для уверенности
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      console.log('📝 Создаем таблицу заданий...');
       await this.pool.query(`
         CREATE TABLE IF NOT EXISTS tasks (
           task_id SERIAL PRIMARY KEY,
-          creator_id BIGINT REFERENCES users(user_id),
+          creator_id BIGINT NOT NULL,
           channel_username VARCHAR(255) NOT NULL,
           channel_title VARCHAR(255),
           reward INTEGER NOT NULL CHECK (reward >= 15 AND reward <= 50),
@@ -49,55 +56,277 @@ class Database {
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
       `);
+      console.log('✅ Таблица tasks создана');
 
-      // Создаем таблицу выполнений з��даний
+      // Прове��яем и добавляем foreign key constraint отдельно
+      console.log('📝 Проверяем и добавляем foreign key для tasks...');
+      try {
+        // Сначала удаляем существующий constraint если есть
+        await this.pool.query(`
+          ALTER TABLE tasks
+          DROP CONSTRAINT IF EXISTS fk_tasks_creator_id
+        `);
+
+        // Проверяем, что колонка creator_id существует и нужного типа
+        const columnCheck = await this.pool.query(`
+          SELECT column_name, data_type
+          FROM information_schema.columns
+          WHERE table_name = 'tasks' AND column_name = 'creator_id'
+        `);
+
+        if (columnCheck.rows.length === 0) {
+          console.log('⚠️ Колонка creator_id не найдена, создаем...');
+          await this.pool.query(`
+            ALTER TABLE tasks
+            ADD COLUMN creator_id BIGINT NOT NULL DEFAULT 0
+          `);
+        }
+
+        // Добавляем foreign key constraint
+        await this.pool.query(`
+          ALTER TABLE tasks
+          ADD CONSTRAINT fk_tasks_creator_id
+          FOREIGN KEY (creator_id) REFERENCES users(user_id)
+        `);
+      } catch (fkError) {
+        console.error('⚠️ Ошибка добавления foreign key для tasks:', fkError.message);
+        // Продолжаем без foreign key constraint
+      }
+      console.log('✅ Foreign key для tasks добавлен');
+
+      console.log('📝 Создаем таблицу выполнений заданий...');
       await this.pool.query(`
         CREATE TABLE IF NOT EXISTS task_completions (
           completion_id SERIAL PRIMARY KEY,
-          task_id INTEGER REFERENCES tasks(task_id),
-          user_id BIGINT REFERENCES users(user_id),
+          task_id INTEGER NOT NULL,
+          user_id BIGINT NOT NULL,
           completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
           is_verified BOOLEAN DEFAULT FALSE,
           UNIQUE(task_id, user_id)
         )
       `);
+      console.log('✅ Таблица task_completions создана');
 
-      // Создаем таблицу спонсорских каналов для чатов
+      // Добавляем foreign key constraints для task_completions
+      console.log('📝 Добавляем foreign keys для task_completions...');
+      try {
+        await this.pool.query(`
+          ALTER TABLE task_completions
+          DROP CONSTRAINT IF EXISTS fk_task_completions_task_id
+        `);
+        await this.pool.query(`
+          ALTER TABLE task_completions
+          DROP CONSTRAINT IF EXISTS fk_task_completions_user_id
+        `);
+        await this.pool.query(`
+          ALTER TABLE task_completions
+          ADD CONSTRAINT fk_task_completions_task_id
+          FOREIGN KEY (task_id) REFERENCES tasks(task_id)
+        `);
+        await this.pool.query(`
+          ALTER TABLE task_completions
+          ADD CONSTRAINT fk_task_completions_user_id
+          FOREIGN KEY (user_id) REFERENCES users(user_id)
+        `);
+      } catch (fkError) {
+        console.error('⚠️ Ошибка добавления foreign keys для task_completions:', fkError.message);
+      }
+      console.log('✅ Foreign keys для task_completions добавлены');
+
+      console.log('📝 Создаем таблицу спонсорских каналов...');
       await this.pool.query(`
         CREATE TABLE IF NOT EXISTS sponsor_channels (
           sponsor_id SERIAL PRIMARY KEY,
           chat_id BIGINT NOT NULL,
           channel_username VARCHAR(255) NOT NULL,
-          added_by BIGINT REFERENCES users(user_id),
+          added_by BIGINT NOT NULL,
           is_active BOOLEAN DEFAULT TRUE,
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
       `);
+      
+      // Foreign key для sponsor_channels
+      console.log('📝 Добавляем foreign key для sponsor_channels...');
+      try {
+        await this.pool.query(`
+          ALTER TABLE sponsor_channels
+          DROP CONSTRAINT IF EXISTS fk_sponsor_channels_added_by
+        `);
+        await this.pool.query(`
+          ALTER TABLE sponsor_channels
+          ADD CONSTRAINT fk_sponsor_channels_added_by
+          FOREIGN KEY (added_by) REFERENCES users(user_id)
+        `);
+      } catch (fkError) {
+        console.error('⚠️ Ошибка добавления foreign key для sponsor_channels:', fkError.message);
+      }
+      console.log('✅ Foreign key для sponsor_channels добавлен');
 
-      // Создаем таблицу рефералов
+      console.log('📝 Создаем таблицу рефералов...');
       await this.pool.query(`
         CREATE TABLE IF NOT EXISTS referrals (
           referral_id SERIAL PRIMARY KEY,
-          referrer_id BIGINT REFERENCES users(user_id),
-          referred_id BIGINT REFERENCES users(user_id),
+          referrer_id BIGINT NOT NULL,
+          referred_id BIGINT NOT NULL,
           bonus_paid BOOLEAN DEFAULT FALSE,
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
       `);
 
-      // Создаем индексы для оптимизации запросов
-      await this.pool.query('CREATE INDEX IF NOT EXISTS idx_users_referral_code ON users(referral_code)');
-      await this.pool.query('CREATE INDEX IF NOT EXISTS idx_tasks_active ON tasks(is_active, reward, created_at)');
-      await this.pool.query('CREATE INDEX IF NOT EXISTS idx_tasks_creator ON tasks(creator_id)');
-      await this.pool.query('CREATE INDEX IF NOT EXISTS idx_task_completions_user ON task_completions(user_id)');
-      await this.pool.query('CREATE INDEX IF NOT EXISTS idx_task_completions_task ON task_completions(task_id)');
-      await this.pool.query('CREATE INDEX IF NOT EXISTS idx_task_completions_unique ON task_completions(task_id, user_id)');
-      await this.pool.query('CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_id)');
-      await this.pool.query('CREATE INDEX IF NOT EXISTS idx_sponsor_channels_chat ON sponsor_channels(chat_id, is_active)');
+      // Foreign keys для referrals
+      console.log('📝 Добавляем foreign keys для referrals...');
+      try {
+        await this.pool.query(`
+          ALTER TABLE referrals
+          DROP CONSTRAINT IF EXISTS fk_referrals_referrer_id
+        `);
+        await this.pool.query(`
+          ALTER TABLE referrals
+          DROP CONSTRAINT IF EXISTS fk_referrals_referred_id
+        `);
+        await this.pool.query(`
+          ALTER TABLE referrals
+          ADD CONSTRAINT fk_referrals_referrer_id
+          FOREIGN KEY (referrer_id) REFERENCES users(user_id)
+        `);
+        await this.pool.query(`
+          ALTER TABLE referrals
+          ADD CONSTRAINT fk_referrals_referred_id
+          FOREIGN KEY (referred_id) REFERENCES users(user_id)
+        `);
+      } catch (fkError) {
+        console.error('⚠️ Ошибка добавления foreign keys для referrals:', fkError.message);
+      }
+      console.log('✅ Foreign keys для referrals добавлены');
 
-      console.log('✅ База данных инициализирована с индексами');
+      // Создаем индексы для оптимизации запросов
+      console.log('📝 Создаем индексы...');
+
+      const indexes = [
+        { name: 'idx_users_referral_code', query: 'CREATE INDEX IF NOT EXISTS idx_users_referral_code ON users(referral_code)' },
+        { name: 'idx_tasks_active', query: 'CREATE INDEX IF NOT EXISTS idx_tasks_active ON tasks(is_active, reward, created_at)' },
+        { name: 'idx_tasks_creator', query: 'CREATE INDEX IF NOT EXISTS idx_tasks_creator ON tasks(creator_id)' },
+        { name: 'idx_task_completions_user', query: 'CREATE INDEX IF NOT EXISTS idx_task_completions_user ON task_completions(user_id)' },
+        { name: 'idx_task_completions_task', query: 'CREATE INDEX IF NOT EXISTS idx_task_completions_task ON task_completions(task_id)' },
+        { name: 'idx_task_completions_unique', query: 'CREATE INDEX IF NOT EXISTS idx_task_completions_unique ON task_completions(task_id, user_id)' },
+        { name: 'idx_referrals_referrer', query: 'CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_id)' },
+        { name: 'idx_sponsor_channels_chat', query: 'CREATE INDEX IF NOT EXISTS idx_sponsor_channels_chat ON sponsor_channels(chat_id, is_active)' }
+      ];
+
+      for (const index of indexes) {
+        try {
+          await this.pool.query(index.query);
+          console.log(`✅ Индекс ${index.name} создан`);
+        } catch (indexError) {
+          console.error(`⚠️ Ошибка создания индекса ${index.name}:`, indexError.message);
+        }
+      }
+
+      // Миграция схемы базы данных
+      console.log('🔄 Проверяем и обновляем схему базы данных...');
+      await this.migrateSchema();
+
+      console.log('✅ База данных полностью инициализирована!');
     } catch (error) {
       console.error('❌ Ошибка инициализации базы данных:', error);
+      throw error; // Пробрасываем ошибку для обработки выше
+    }
+  }
+
+  async migrateSchema() {
+    try {
+      console.log('🔄 Начинаем миграцию схемы...');
+
+      // Миграция таблицы users
+      console.log('📝 Миграция таблицы users...');
+
+      // Добавляем недостающие колонки в users
+      const userMigrations = [
+        { column: 'user_id', sql: 'ALTER TABLE users ADD COLUMN user_id BIGINT' },
+        { column: 'tick_balance', sql: 'ALTER TABLE users ADD COLUMN tick_balance INTEGER DEFAULT 0' },
+        { column: 'referral_code', sql: 'ALTER TABLE users ADD COLUMN referral_code VARCHAR(50) UNIQUE' },
+        { column: 'last_name', sql: 'ALTER TABLE users ADD COLUMN last_name VARCHAR(255)' },
+        { column: 'is_banned', sql: 'ALTER TABLE users ADD COLUMN is_banned BOOLEAN DEFAULT FALSE' }
+      ];
+
+      for (const migration of userMigrations) {
+        try {
+          // Проверяем, существует ли колонка
+          const columnExists = await this.pool.query(`
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name = 'users' AND column_name = $1
+          `, [migration.column]);
+
+          if (columnExists.rows.length === 0) {
+            await this.pool.query(migration.sql);
+            console.log(`✅ Добавлена колонка users.${migration.column}`);
+          }
+        } catch (migrationError) {
+          console.error(`⚠️ Ошибка миграции users.${migration.column}:`, migrationError.message);
+        }
+      }
+
+      // Копируем данные id -> user_id если user_id пустой
+      try {
+        await this.pool.query(`
+          UPDATE users SET user_id = id WHERE user_id IS NULL OR user_id = 0
+        `);
+
+        // Копируем balance -> tick_balance
+        await this.pool.query(`
+          UPDATE users SET tick_balance = COALESCE(balance, 0) WHERE tick_balance = 0
+        `);
+
+        console.log('✅ Данные users мигрированы');
+      } catch (dataError) {
+        console.error('⚠️ Ошибка миграции данных users:', dataError.message);
+      }
+
+      // Миграция таблицы tasks
+      console.log('📝 Миграция таблицы tasks...');
+
+      const taskMigrations = [
+        { column: 'task_id', sql: 'ALTER TABLE tasks ADD COLUMN task_id SERIAL' },
+        { column: 'channel_title', sql: 'ALTER TABLE tasks ADD COLUMN channel_title VARCHAR(255)' },
+        { column: 'description', sql: 'ALTER TABLE tasks ADD COLUMN description TEXT' },
+        { column: 'max_completions', sql: 'ALTER TABLE tasks ADD COLUMN max_completions INTEGER DEFAULT 1000' }
+      ];
+
+      for (const migration of taskMigrations) {
+        try {
+          const columnExists = await this.pool.query(`
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name = 'tasks' AND column_name = $1
+          `, [migration.column]);
+
+          if (columnExists.rows.length === 0) {
+            await this.pool.query(migration.sql);
+            console.log(`✅ Добавлена колонка tasks.${migration.column}`);
+          }
+        } catch (migrationError) {
+          console.error(`⚠️ Ошибка миграции tasks.${migration.column}:`, migrationError.message);
+        }
+      }
+
+      // Копируем данные id -> task_id, owner_id -> creator_id
+      try {
+        await this.pool.query(`
+          UPDATE tasks SET task_id = id WHERE task_id IS NULL OR task_id = 0
+        `);
+
+        // Если creator_id пустой, копируем из owner_id
+        await this.pool.query(`
+          UPDATE tasks SET creator_id = COALESCE(owner_id, creator_id) WHERE creator_id IS NULL OR creator_id = 0
+        `);
+
+        console.log('✅ Данные tasks мигрированы');
+      } catch (dataError) {
+        console.error('⚠️ Ошибка миграции данных tasks:', dataError.message);
+      }
+
+      console.log('✅ Миграция схемы завершена');
+    } catch (error) {
+      console.error('❌ Ошибка миграции схемы:', error);
     }
   }
 
@@ -117,7 +346,7 @@ class Database {
       );
       return result.rows[0] || await this.getUser(user_id);
     } catch (error) {
-      console.error('Ошибка ��оздания пользователя:', error);
+      console.error('Ошибка создания пользователя:', error);
       // Попытка получить существующего пользователя
       try {
         return await this.getUser(user_id);
